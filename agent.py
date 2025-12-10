@@ -39,16 +39,19 @@ identification_agent = LlmAgent(
     name="identification_agent",
     model="gemini-2.5-pro",
     instruction="""Your purpose is to identify the species in the image.
-    1. Read the `CaseFile` from the session state to find the `imageUri`.
-    2. Call the `identify_insect_with_google_search` tool, passing the `imageUri` as the `image_uri` argument.
-    3. The tool will return a JSON object containing an 'identification' key.
-    4. You MUST then call the `update_case_file_with_identification` tool, passing the value from the 'identification' key as the `identification` argument.""",
+1. Call the `identify_insect_with_google_search` tool.
+2. The tool will return a JSON object containing an 'identification' key.
+3. You MUST then call the `update_case_file_with_identification` tool, passing the value from the 'identification' key as the `identification` argument.""",
     tools=[tools.identify_insect_with_google_search, tools.update_case_file_with_identification],
 )
 threat_analyst_agent = LlmAgent(
     name="threat_analyst_agent",
     model="gemini-2.5-flash",
-    instruction="Your purpose is to analyze the threat level of the identified species.\n1. Get the species name from the CaseFile.\n2. Call the 'get_mpi_summary' tool with the species name.\n3. Call the 'cross_reference_biosecurity_databases' tool.",
+    instruction="""Your purpose is to analyze the threat level of the identified species.
+1. Access the session state and find the `CaseFile` dictionary.
+2. From the `CaseFile` dictionary, get the value of the `topGuess` key from the `identification` dictionary.
+3. Call the 'get_mpi_summary' tool with the species name.
+4. Call the 'cross_reference_biosecurity_databases' tool.""",
     tools=[tools.get_mpi_summary, tools.cross_reference_biosecurity_databases],
 )
 risk_assessment_agent = LlmAgent(
@@ -88,14 +91,17 @@ root_agent = LlmAgent(
     instruction="""You are the primary orchestrator for the Bio-Secure NZ system. Your job is to handle initial user requests and kick off the analysis pipeline.
 
     Workflow:
-    1.  **Start Analysis:** When the user asks to analyze an insect, your first job is to call the `upload_latest_image_to_gcs` tool. This tool will retrieve the URI for a pre-defined image.
-    2.  **Create CaseFile:** After the tool returns a GCS URI, create a `CaseFile` object in the session state with a `caseId`, and the `imageUri`.
-    3.  **Location:** Check if the user has provided a location in their message. If so, add it to the `CaseFile`. If not, ask the user for the location.
-    4.  **Invoke Pipeline:** Once the `CaseFile` is in the state and has a location, call the `analysis_pipeline_agent` tool to run the full analysis.
-    5.  **No Image:** If the user has not provided an image, ask them to upload one.
+    1.  **Start Analysis:** When the user asks to analyze an insect, you MUST call the `get_default_insect_image_gcs_uri` tool to get the image URI.
+    2.  **Create CaseFile:** After the `get_default_insect_image_gcs_uri` tool returns a GCS URI, you MUST call the `create_case_file` tool, passing the `image_uri` from the previous step.
+    3.  **Get Location:** You MUST ask the user for the location where the insect was found.
+    4.  **Update Location:** Once the user provides a location, you MUST call the `update_case_file_with_location` tool, passing the user-provided location string as the `location` argument.
+    5.  **Invoke Pipeline:** After `update_case_file_with_location` is successful, you MUST call the `analysis_pipeline_agent` tool to run the full analysis.
+    6.  **Error Handling:** If any tool call fails, inform the user of the error and stop the process.
     """,
     tools=[
-        tools.upload_latest_image_to_gcs,
+        tools.get_default_insect_image_gcs_uri,
+        tools.create_case_file,
+        tools.update_case_file_with_location,
         AgentTool(analysis_pipeline_agent)
     ],
 )
