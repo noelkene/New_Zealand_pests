@@ -23,6 +23,11 @@ from google.cloud import bigquery
 from google.adk.tools import ToolContext
 from google import genai
 from google.genai import types
+import json
+import urllib.request
+import urllib.parse
+import ssl
+import certifi
 
 
 def get_mpi_summary(species_name: str, tool_context: ToolContext) -> dict:
@@ -160,9 +165,10 @@ def get_weather_forecast(latitude: float, longitude: float, tool_context: ToolCo
         return {"status": "error", "message": f"Failed to retrieve weather forecast: {e}"}
 
 
-def upload_latest_image_to_gcs(tool_context: ToolContext) -> dict:
+def get_default_insect_image_gcs_uri(tool_context: ToolContext) -> dict:
     """
     Retrieves the GCS URI for the default insect image.
+    This tool does not upload an image; it retrieves the URI of a pre-defined image.
 
     Args:
         tool_context: The context for the tool.
@@ -170,8 +176,8 @@ def upload_latest_image_to_gcs(tool_context: ToolContext) -> dict:
     Returns:
         A dictionary containing the GCS URI of the file.
     """
-    print("--- TOOL: upload_latest_image_to_gcs called ---")
-    
+    print("--- TOOL: get_default_insect_image_gcs_uri called ---")
+
     # Bucket and object are hardcoded as per user's request to simplify.
     bucket_name = "new-zealand-insects"
     object_name = "insect1.png"
@@ -181,7 +187,7 @@ def upload_latest_image_to_gcs(tool_context: ToolContext) -> dict:
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(object_name)
-        
+
         if blob.exists():
             print(f"Found existing image in GCS bucket: {gcs_uri}")
             return {"status": "success", "gcs_uri": gcs_uri}
@@ -189,7 +195,7 @@ def upload_latest_image_to_gcs(tool_context: ToolContext) -> dict:
             message = f"Default image not found at {gcs_uri}."
             print(message)
             return {"status": "error", "message": message}
-            
+
     except Exception as e:
         print(f"Error checking for existing image in GCS: {e}")
         return {"status": "error", "message": f"Error accessing GCS: {e}"}
@@ -263,9 +269,10 @@ def generate_and_send_report(tool_context: ToolContext) -> dict:
         return {"status": "error", "message": "CaseFile is incomplete for final reporting."}
 
     # Get image url
-    bucket_name = os.environ.get("GCS_BUCKET_NAME")
-    image_url = f"https://storage.mtls.cloud.google.com/{bucket_name}/insect1.png"
-    
+    # Using the hardcoded bucket name for consistency with image retrieval
+    image_bucket_name = "new-zealand-insects"
+    image_url = f"https://storage.mtls.cloud.google.com/{image_bucket_name}/insect1.png"
+
     # Get coordinates for Google Maps link
     lat = case_file['location']['lat']
     lon = case_file['location']['lon']
@@ -346,16 +353,16 @@ def generate_and_send_report(tool_context: ToolContext) -> dict:
         tmp_report_path = f"/tmp/report-{uuid.uuid4()}.html"
         with open(tmp_report_path, "w") as f:
             f.write(report_html)
-        
+
         # Upload HTML report to GCS using gcloud
         report_blob_name = f"reports/report-{uuid.uuid4()}.html"
-        gcs_uri = f"gs://{bucket_name}/{report_blob_name}"
-        
+        gcs_uri = f"gs://{image_bucket_name}/{report_blob_name}"
+
         upload_command = ["gcloud", "storage", "cp", tmp_report_path, gcs_uri]
         subprocess.run(upload_command, check=True)
-        
+
         # Construct the direct GCS URL for the report
-        report_url = f"https://storage.mtls.cloud.google.com/{bucket_name}/{report_blob_name}"
+        report_url = f"https://storage.mtls.cloud.google.com/{image_bucket_name}/{report_blob_name}"
 
         print(f"HTML report uploaded to: {report_url}")
 
@@ -388,15 +395,20 @@ def generate_and_send_report(tool_context: ToolContext) -> dict:
         "report_url": report_url
     }
 
-def identify_insect_with_google_search(image_uri: str) -> dict:
+def identify_insect_with_google_search(tool_context: ToolContext) -> dict:
     """Identifies an insect from an image using Google Search.
 
     Args:
-        image_uri: The GCS URI of the image to analyze.
+        tool_context: The context for the tool, used to access session state.
 
     Returns:
         A dictionary containing the identification results.
     """
+    case_file = tool_context.state.get("caseFile", {})
+    image_uri = case_file.get("imageUri")
+    if not image_uri:
+        return {"status": "error", "message": "No image URI found in CaseFile."}
+
     print(f"--- TOOL: identify_insect_with_google_search called with image_uri={image_uri} ---")
     client = genai.Client(vertexai=True)
 
@@ -490,10 +502,95 @@ def update_case_file_with_risk_assessment(risk_assessment: str, tool_context: To
         nearby_assets.append("vineyards")
 
     case_file["riskAssessment"] = {
-        "summary": risk_assessment, 
+        "summary": risk_assessment,
         "alertLevel": alert_level,
         "nearbyAssets": nearby_assets
     }
     tool_context.state["caseFile"] = case_file
     print(f"CaseFile updated: {case_file}")
     return {"status": "success", "message": "CaseFile updated with risk assessment."}
+
+def create_case_file(image_uri: str, tool_context: ToolContext) -> dict:
+    """
+    Creates a new CaseFile in the session state with a generated ID and the provided image URI.
+
+    Args:
+        image_uri: The GCS URI of the image associated with this case.
+        tool_context: The context for the tool.
+
+    Returns:
+        A dictionary containing the status and the initial CaseFile details.
+    """
+    print(f"--- TOOL: create_case_file called with image_uri={image_uri} ---")
+    case_id = str(uuid.uuid4())
+    initial_case_file = {
+        "caseId": case_id,
+        "imageUri": image_uri,
+        "location": None,
+        "identification": None,
+        "threatProfile": None,
+        "riskAssessment": None,
+        "status": "Initiated"
+    }
+    tool_context.state["caseFile"] = initial_case_file
+    print(f"CaseFile created: {initial_case_file}")
+    return {"status": "success", "caseFile": initial_case_file}
+
+def update_case_file_with_location(location: str, tool_context: ToolContext) -> dict:
+    """
+    Updates the CaseFile with geocoded location data (latitude and longitude) using the Google Geocoding API.
+
+    Args:
+        location: The human-readable location string (e.g., "1600 Amphitheatre Parkway, Mountain View, CA").
+        tool_context: The context for the tool.
+
+    Returns:
+        A dictionary containing the status and the updated CaseFile details.
+    """
+    print(f"--- TOOL: update_case_file_with_location called with location={location} ---")
+    case_file = tool_context.state.get("caseFile", {})
+    if not case_file:
+        return {"status": "error", "message": "No CaseFile found in session state."}
+
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        return {"status": "error", "message": "GOOGLE_MAPS_API_KEY environment variable not set."}
+
+    params = {
+        'address': location,
+        'key': api_key
+    }
+    geocode_url = f"https://maps.googleapis.com/maps/api/geocode/json?{urllib.parse.urlencode(params)}"
+
+    try:
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(geocode_url, context=context) as response:
+            geocode_data = json.loads(response.read().decode())
+
+        if geocode_data["status"] == "OK":
+            lat = geocode_data["results"][0]["geometry"]["location"]["lat"]
+            lng = geocode_data["results"][0]["geometry"]["location"]["lng"]
+
+            case_file["location"] = {
+                "description": location,
+                "lat": lat,
+                "lon": lng
+            }
+            tool_context.state["caseFile"] = case_file
+            print(f"CaseFile updated with location: {case_file['location']}")
+            return {"status": "success", "caseFile": case_file}
+        else:
+            error_message = geocode_data.get("error_message", geocode_data["status"])
+            print(f"Geocoding API error: {error_message}")
+            return {"status": "error", "message": f"Geocoding failed: {error_message}"}
+
+    except urllib.error.URLError as e:
+        print(f"Error calling Geocoding API: {e}")
+        return {"status": "error", "message": f"Failed to connect to Geocoding API: {e.reason}"}
+    except (KeyError, IndexError) as e:
+        print(f"Error parsing Geocoding API response: {e}")
+        return {"status": "error", "message": "Failed to parse geocoding response."}
+    except json.JSONDecodeError as e:
+        print(f"Error decoding Geocoding API response: {e}")
+        return {"status": "error", "message": "Invalid response from Geocoding API."}
+
